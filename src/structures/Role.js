@@ -1,3 +1,5 @@
+'use strict';
+
 const Snowflake = require('../util/Snowflake');
 const Permissions = require('../util/Permissions');
 const Util = require('../util/Util');
@@ -54,7 +56,7 @@ class Role extends Base {
 
     /**
      * The permissions of the role
-     * @type {Permissions}
+     * @type {Readonly<Permissions>}
      */
     this.permissions = new Permissions(data.permissions).freeze();
 
@@ -170,7 +172,7 @@ class Role extends Base {
    *   .catch(console.error);
    */
   async edit(data, reason) {
-    if (data.permissions) data.permissions = Permissions.resolve(data.permissions);
+    if (typeof data.permissions !== 'undefined') data.permissions = Permissions.resolve(data.permissions);
     else data.permissions = this.permissions.bitfield;
     if (typeof data.position !== 'undefined') {
       await Util.setPosition(this, data.position, false, this.guild._sortedRoles(),
@@ -203,7 +205,7 @@ class Role extends Base {
    * Returns `channel.permissionsFor(role)`. Returns permissions for a role in a guild channel,
    * taking into account permission overwrites.
    * @param {ChannelResolvable} channel The guild channel to use as context
-   * @returns {?Permissions}
+   * @returns {Readonly<Permissions>}
    */
   permissionsIn(channel) {
     channel = this.guild.channels.resolve(channel);

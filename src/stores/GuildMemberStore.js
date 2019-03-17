@@ -1,3 +1,5 @@
+'use strict';
+
 const DataStore = require('./DataStore');
 const GuildMember = require('../structures/GuildMember');
 const { Events, OPCodes } = require('../util/Constants');
@@ -14,8 +16,8 @@ class GuildMemberStore extends DataStore {
     this.guild = guild;
   }
 
-  add(data, cache) {
-    return super.add(data, cache, { extras: [this.guild] });
+  add(data, cache = true) {
+    return super.add(data, cache, { id: data.user.id, extras: [this.guild] });
   }
 
   /**
@@ -178,7 +180,7 @@ class GuildMemberStore extends DataStore {
 
   _fetchSingle({ user, cache }) {
     const existing = this.get(user);
-    if (existing && existing.joinedTimestamp) return Promise.resolve(existing);
+    if (existing && !existing.partial) return Promise.resolve(existing);
     return this.client.api.guilds(this.guild.id).members(user).get()
       .then(data => this.add(data, cache));
   }
@@ -189,7 +191,7 @@ class GuildMemberStore extends DataStore {
         resolve(query || limit ? new Collection() : this);
         return;
       }
-      this.guild.client.ws.send({
+      this.guild.shard.send({
         op: OPCodes.REQUEST_GUILD_MEMBERS,
         d: {
           guild_id: this.guild.id,

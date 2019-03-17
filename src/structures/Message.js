@@ -1,3 +1,5 @@
+'use strict';
+
 const Mentions = require('./MessageMentions');
 const MessageAttachment = require('./MessageAttachment');
 const Embed = require('./MessageEmbed');
@@ -10,7 +12,7 @@ const { MessageTypes } = require('../util/Constants');
 const Permissions = require('../util/Permissions');
 const Base = require('./Base');
 const { Error, TypeError } = require('../errors');
-const { createMessage } = require('./shared');
+const APIMessage = require('./APIMessage');
 
 /**
  * Represents a message on Discord.
@@ -22,9 +24,15 @@ class Message extends Base {
 
     /**
      * The channel that the message was sent in
-     * @type {TextChannel|DMChannel|GroupDMChannel}
+     * @type {TextChannel|DMChannel}
      */
     this.channel = channel;
+
+    /**
+     * Whether this message has been deleted
+     * @type {boolean}
+     */
+    this.deleted = false;
 
     if (data) this._patch(data);
   }
@@ -52,7 +60,7 @@ class Message extends Base {
      * The author of the message
      * @type {User}
      */
-    this.author = this.client.users.add(data.author, !data.webhook_id);
+    this.author = data.author ? this.client.users.add(data.author, !data.webhook_id) : null;
 
     /**
      * Whether or not this message is pinned
@@ -82,17 +90,19 @@ class Message extends Base {
      * A list of embeds in the message - e.g. YouTube Player
      * @type {MessageEmbed[]}
      */
-    this.embeds = data.embeds.map(e => new Embed(e));
+    this.embeds = (data.embeds || []).map(e => new Embed(e));
 
     /**
      * A collection of attachments in the message - e.g. Pictures - mapped by their ID
      * @type {Collection<Snowflake, MessageAttachment>}
      */
     this.attachments = new Collection();
-    for (const attachment of data.attachments) {
-      this.attachments.set(attachment.id, new MessageAttachment(
-        attachment.url, attachment.filename, attachment
-      ));
+    if (data.attachments) {
+      for (const attachment of data.attachments) {
+        this.attachments.set(attachment.id, new MessageAttachment(
+          attachment.url, attachment.filename, attachment
+        ));
+      }
     }
 
     /**
@@ -146,23 +156,25 @@ class Message extends Base {
     } : null;
 
     /**
-     * Whether this message is a hit in a search
-     * @type {?boolean}
-     */
-    this.hit = typeof data.hit === 'boolean' ? data.hit : null;
-
-    /**
      * The previous versions of the message, sorted with the most recent first
      * @type {Message[]}
      * @private
      */
     this._edits = [];
 
-    /**
-     * Whether this message has been deleted
-     * @type {boolean}
-     */
-    this.deleted = false;
+    if (this.member && data.member) {
+      this.member._patch(data.member);
+    } else if (data.member && this.guild && this.author) {
+      this.guild.members.add(Object.assign(data.member, { user: this.author }));
+    }
+  }
+
+  /**
+   * Whether or not this message is a partial
+   * @type {boolean}
+   */
+  get partial() {
+    return typeof this.content !== 'string' || !this.author;
   }
 
   /**
@@ -238,41 +250,22 @@ class Message extends Base {
   }
 
   /**
+   * The url to jump to this message
+   * @type {string}
+   * @readonly
+   */
+  get url() {
+    return `https://discordapp.com/channels/${this.guild ? this.guild.id : '@me'}/${this.channel.id}/${this.id}`;
+  }
+
+  /**
    * The message contents with all mentions replaced by the equivalent text.
    * If mentions cannot be resolved to a name, the relevant mention in the message content will not be converted.
    * @type {string}
    * @readonly
    */
   get cleanContent() {
-    return this.content
-      .replace(/@(everyone|here)/g, '@\u200b$1')
-      .replace(/<@!?[0-9]+>/g, input => {
-        const id = input.replace(/<|!|>|@/g, '');
-        if (this.channel.type === 'dm' || this.channel.type === 'group') {
-          return this.client.users.has(id) ? `@${this.client.users.get(id).username}` : input;
-        }
-
-        const member = this.channel.guild.members.get(id);
-        if (member) {
-          if (member.nickname) return `@${member.nickname}`;
-          return `@${member.user.username}`;
-        } else {
-          const user = this.client.users.get(id);
-          if (user) return `@${user.username}`;
-          return input;
-        }
-      })
-      .replace(/<#[0-9]+>/g, input => {
-        const channel = this.client.channels.get(input.replace(/<|#|>/g, ''));
-        if (channel) return `#${channel.name}`;
-        return input;
-      })
-      .replace(/<@&[0-9]+>/g, input => {
-        if (this.channel.type === 'dm' || this.channel.type === 'group') return input;
-        const role = this.guild.roles.get(input.replace(/<|@|>|&/g, ''));
-        if (role) return `@${role.name}`;
-        return input;
-      });
+    return Util.cleanContent(this.content, this);
   }
 
   /**
@@ -348,7 +341,7 @@ class Message extends Base {
    */
   get deletable() {
     return !this.deleted && (this.author.id === this.client.user.id || (this.guild &&
-      this.channel.permissionsFor(this.client.user).has(Permissions.FLAGS.MANAGE_MESSAGES)
+      this.channel.permissionsFor(this.client.user).has(Permissions.FLAGS.MANAGE_MESSAGES, false)
     ));
   }
 
@@ -359,7 +352,7 @@ class Message extends Base {
    */
   get pinnable() {
     return !this.guild ||
-      this.channel.permissionsFor(this.client.user).has(Permissions.FLAGS.MANAGE_MESSAGES);
+      this.channel.permissionsFor(this.client.user).has(Permissions.FLAGS.MANAGE_MESSAGES, false);
   }
 
   /**
@@ -372,7 +365,7 @@ class Message extends Base {
 
   /**
    * Edits the content of the message.
-   * @param {StringResolvable} [content] The new content for the message
+   * @param {StringResolvable|APIMessage} [content] The new content for the message
    * @param {MessageEditOptions|MessageEmbed} [options] The options to provide
    * @returns {Promise<Message>}
    * @example
@@ -381,17 +374,10 @@ class Message extends Base {
    *   .then(msg => console.log(`Updated the content of a message to ${msg.content}`))
    *   .catch(console.error);
    */
-  async edit(content, options) {
-    if (!options && typeof content === 'object' && !(content instanceof Array)) {
-      options = content;
-      content = null;
-    } else if (!options) {
-      options = {};
-    }
-    if (!options.content) options.content = content;
-
-    const { data } = await createMessage(this, options);
-
+  edit(content, options) {
+    const { data } = content instanceof APIMessage ?
+      content.resolveData() :
+      APIMessage.create(this, content, options).resolveData();
     return this.client.api.channels[this.channel.id].messages[this.id]
       .patch({ data })
       .then(d => {
@@ -480,37 +466,28 @@ class Message extends Base {
 
   /**
    * Replies to the message.
-   * @param {StringResolvable} [content] The content for the message
-   * @param {MessageOptions} [options] The options to provide
+   * @param {StringResolvable|APIMessage} [content=''] The content for the message
+   * @param {MessageOptions|MessageAdditions} [options={}] The options to provide
    * @returns {Promise<Message|Message[]>}
    * @example
    * // Reply to a message
    * message.reply('Hey, I\'m a reply!')
-   *   .then(msg => console.log(`Sent a reply to ${msg.author.username}`))
+   *   .then(() => console.log(`Sent a reply to ${message.author.username}`))
    *   .catch(console.error);
    */
   reply(content, options) {
-    if (!options && typeof content === 'object' && !(content instanceof Array)) {
-      options = content;
-      content = '';
-    } else if (!options) {
-      options = {};
-    }
-    return this.channel.send(content, Object.assign(options, { reply: this.member || this.author }));
+    return this.channel.send(content instanceof APIMessage ?
+      content :
+      APIMessage.transformOptions(content, options, { reply: this.member || this.author })
+    );
   }
 
   /**
-   * Marks the message as read.
-   * <warn>This is only available when using a user account.</warn>
+   * Fetch this message.
    * @returns {Promise<Message>}
    */
-  acknowledge() {
-    return this.client.api.channels(this.channel.id).messages(this.id).ack
-      .post({ data: { token: this.client.rest._ackToken } })
-      .then(res => {
-        if (res.token) this.client.rest._ackToken = res.token;
-        return this;
-      });
+  fetch() {
+    return this.channel.messages.fetch(this.id, true);
   }
 
   /**

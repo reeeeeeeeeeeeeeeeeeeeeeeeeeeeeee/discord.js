@@ -1,3 +1,5 @@
+'use strict';
+
 const GuildEmoji = require('./GuildEmoji');
 const Util = require('../util/Util');
 const ReactionEmoji = require('./ReactionEmoji');
@@ -71,7 +73,7 @@ class MessageReaction {
     this.users.delete(user.id);
     if (!this.me || user.id !== this.message.client.user.id) this.count--;
     if (user.id === this.message.client.user.id) this.me = false;
-    if (this.count <= 0) {
+    if (this.count <= 0 && this.users.size === 0) {
       this.message.reactions.remove(this.emoji.id || this.emoji.name);
     }
   }

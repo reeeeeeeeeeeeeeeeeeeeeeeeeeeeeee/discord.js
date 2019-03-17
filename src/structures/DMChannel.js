@@ -1,3 +1,5 @@
+'use strict';
+
 const Channel = require('./Channel');
 const TextBasedChannel = require('./interfaces/TextBasedChannel');
 const MessageStore = require('../stores/MessageStore');
@@ -10,6 +12,8 @@ const MessageStore = require('../stores/MessageStore');
 class DMChannel extends Channel {
   constructor(client, data) {
     super(client, data);
+    // Override the channel type so partials have a known type
+    this.type = 'dm';
     /**
      * A collection containing the messages sent to this channel
      * @type {MessageStore<Snowflake, Message>}
@@ -21,13 +25,33 @@ class DMChannel extends Channel {
   _patch(data) {
     super._patch(data);
 
-    /**
-     * The recipient on the other end of the DM
-     * @type {User}
-     */
-    this.recipient = this.client.users.add(data.recipients[0]);
+    if (data.recipients) {
+      /**
+       * The recipient on the other end of the DM
+       * @type {User}
+       */
+      this.recipient = this.client.users.add(data.recipients[0]);
+    }
 
+    /**
+     * The ID of the last message in the channel, if one was sent
+     * @type {?Snowflake}
+     */
     this.lastMessageID = data.last_message_id;
+
+    /**
+     * The timestamp when the last pinned message was pinned, if there was one
+     * @type {?number}
+     */
+    this.lastPinTimestamp = data.last_pin_timestamp ? new Date(data.last_pin_timestamp).getTime() : null;
+  }
+
+  /**
+   * Whether this DMChannel is a partial
+   * @type {boolean}
+   */
+  get partial() {
+    return !this.recipient;
   }
 
   /**
@@ -45,8 +69,8 @@ class DMChannel extends Channel {
   // These are here only for documentation purposes - they are implemented by TextBasedChannel
   /* eslint-disable no-empty-function */
   get lastMessage() {}
+  get lastPinAt() {}
   send() {}
-  search() {}
   startTyping() {}
   stopTyping() {}
   get typing() {}

@@ -1,12 +1,24 @@
+'use strict';
+
 const VoiceWebSocket = require('./networking/VoiceWebSocket');
 const VoiceUDP = require('./networking/VoiceUDPClient');
 const Util = require('../../util/Util');
-const { OPCodes, VoiceOPCodes, VoiceStatus } = require('../../util/Constants');
+const { OPCodes, VoiceOPCodes, VoiceStatus, Events } = require('../../util/Constants');
 const AudioPlayer = require('./player/AudioPlayer');
 const VoiceReceiver = require('./receiver/Receiver');
 const EventEmitter = require('events');
 const { Error } = require('../../errors');
 const PlayInterface = require('./util/PlayInterface');
+const Speaking = require('../../util/Speaking');
+const Silence = require('./util/Silence');
+
+// Workaround for Discord now requiring silence to be sent before being able to receive audio
+class SingleSilence extends Silence {
+  _read() {
+    super._read();
+    this.push(null);
+  }
+}
 
 const SUPPORTED_MODES = [
   'xsalsa20_poly1305_lite',
@@ -37,12 +49,6 @@ class VoiceConnection extends EventEmitter {
     this.voiceManager = voiceManager;
 
     /**
-     * The client that instantiated this connection
-     * @type {Client}
-     */
-    this.client = voiceManager.client;
-
-    /**
      * The voice channel this connection is currently serving
      * @type {VoiceChannel}
      */
@@ -55,16 +61,10 @@ class VoiceConnection extends EventEmitter {
     this.status = VoiceStatus.AUTHENTICATING;
 
     /**
-     * Whether we're currently transmitting audio
-     * @type {boolean}
+     * Our current speaking state
+     * @type {Readonly<Speaking>}
      */
-    this.speaking = false;
-
-    /**
-     * An array of Voice Receivers that have been created for this connection
-     * @type {VoiceReceiver[]}
-     */
-    this.receivers = [];
+    this.speaking = new Speaking().freeze();
 
     /**
      * The authentication data needed to connect to the voice server
@@ -100,11 +100,18 @@ class VoiceConnection extends EventEmitter {
     this.once('closing', () => this.player.destroy());
 
     /**
-     * Map SSRC to speaking values
-     * @type {Map<number, boolean>}
+     * Map SSRC values to user IDs
+     * @type {Map<number, Snowflake>}
      * @private
      */
     this.ssrcMap = new Map();
+
+    /**
+     * Tracks which users are talking
+     * @type {Map<Snowflake, Readonly<Speaking>>}
+     * @private
+     */
+    this._speaking = new Map();
 
     /**
      * Object that wraps contains the `ws` and `udp` sockets of this voice connection
@@ -113,7 +120,19 @@ class VoiceConnection extends EventEmitter {
      */
     this.sockets = {};
 
-    this.authenticate();
+    /**
+     * The voice receiver of this connection
+     * @type {VoiceReceiver}
+     */
+    this.receiver = new VoiceReceiver(this);
+  }
+
+  /**
+   * The client that instantiated this connection
+   * @type {Client}
+   */
+  get client() {
+    return this.voiceManager.client;
   }
 
   /**
@@ -126,18 +145,18 @@ class VoiceConnection extends EventEmitter {
   }
 
   /**
-   * Sets whether the voice connection should display as "speaking" or not.
-   * @param {boolean} value Whether or not to speak
+   * Sets whether the voice connection should display as "speaking", "soundshare" or "none".
+   * @param {BitFieldResolvable} value The new speaking state
    * @private
    */
   setSpeaking(value) {
-    if (this.speaking === value) return;
+    if (this.speaking.equals(value)) return;
     if (this.status !== VoiceStatus.CONNECTED) return;
-    this.speaking = value;
+    this.speaking = new Speaking(value).freeze();
     this.sockets.ws.sendPacket({
       op: VoiceOPCodes.SPEAKING,
       d: {
-        speaking: this.speaking,
+        speaking: this.speaking.bitfield,
         delay: 0,
         ssrc: this.authentication.ssrc,
       },
@@ -159,7 +178,10 @@ class VoiceConnection extends EventEmitter {
       self_deaf: false,
     }, options);
 
-    this.client.ws.send({
+    const queueLength = this.channel.guild.shard.ratelimit.queue.length;
+    this.emit('debug', `Sending voice state update (queue length is ${queueLength}): ${JSON.stringify(options)}`);
+
+    this.channel.guild.shard.send({
       op: OPCodes.VOICE_STATE_UPDATE,
       d: options,
     });
@@ -173,6 +195,7 @@ class VoiceConnection extends EventEmitter {
    * @returns {void}
    */
   setTokenAndEndpoint(token, endpoint) {
+    this.emit('debug', `Token "${token}" and endpoint "${endpoint}"`);
     if (!endpoint) {
       // Signifies awaiting endpoint stage
       return;
@@ -184,6 +207,7 @@ class VoiceConnection extends EventEmitter {
     }
 
     endpoint = endpoint.match(/([^:]*)/)[0];
+    this.emit('debug', `Endpoint resolved as ${endpoint}`);
 
     if (!endpoint) {
       this.authenticateFailed('VOICE_INVALID_ENDPOINT');
@@ -205,6 +229,7 @@ class VoiceConnection extends EventEmitter {
    * @private
    */
   setSessionID(sessionID) {
+    this.emit('debug', `Setting sessionID ${sessionID} (stored as "${this.authentication.sessionID}")`);
     if (!sessionID) {
       this.authenticateFailed('VOICE_SESSION_ABSENT');
       return;
@@ -230,9 +255,8 @@ class VoiceConnection extends EventEmitter {
    */
   checkAuthenticated() {
     const { token, endpoint, sessionID } = this.authentication;
-
+    this.emit('debug', `Authenticated with sessionID ${sessionID}`);
     if (token && endpoint && sessionID) {
-      clearTimeout(this.connectTimeout);
       this.status = VoiceStatus.CONNECTING;
       /**
        * Emitted when we successfully initiate a voice connection.
@@ -250,6 +274,7 @@ class VoiceConnection extends EventEmitter {
    */
   authenticateFailed(reason) {
     clearTimeout(this.connectTimeout);
+    this.emit('debug', `Authenticate failed - ${reason}`);
     if (this.status === VoiceStatus.AUTHENTICATING) {
       /**
        * Emitted when we fail to initiate a voice connection.
@@ -297,8 +322,9 @@ class VoiceConnection extends EventEmitter {
   reconnect(token, endpoint) {
     this.authentication.token = token;
     this.authentication.endpoint = endpoint;
-    this.speaking = false;
+    this.speaking = new Speaking().freeze();
     this.status = VoiceStatus.RECONNECTING;
+    this.emit('debug', `Reconnecting to ${endpoint}`);
     /**
      * Emitted when the voice connection is reconnecting (typically after a region change).
      * @event VoiceConnection#reconnecting
@@ -312,6 +338,7 @@ class VoiceConnection extends EventEmitter {
    */
   disconnect() {
     this.emit('closing');
+    this.emit('debug', 'disconnect() triggered');
     clearTimeout(this.connectTimeout);
     const conn = this.voiceManager.connections.get(this.channel.guild.id);
     if (conn === this) this.voiceManager.connections.delete(this.channel.guild.id);
@@ -342,8 +369,10 @@ class VoiceConnection extends EventEmitter {
    */
   cleanup() {
     this.player.destroy();
-    this.speaking = false;
+    this.speaking = new Speaking().freeze();
     const { ws, udp } = this.sockets;
+
+    this.emit('debug', 'Connection clean up');
 
     if (ws) {
       ws.removeAllListeners('error');
@@ -363,6 +392,7 @@ class VoiceConnection extends EventEmitter {
    * @private
    */
   connect() {
+    this.emit('debug', `Connect triggered`);
     if (this.status !== VoiceStatus.RECONNECTING) {
       if (this.sockets.ws) throw new Error('WS_CONNECTION_EXISTS');
       if (this.sockets.udp) throw new Error('UDP_CONNECTION_EXISTS');
@@ -376,11 +406,15 @@ class VoiceConnection extends EventEmitter {
 
     const { ws, udp } = this.sockets;
 
+    ws.on('debug', msg => this.emit('debug', msg));
+    udp.on('debug', msg => this.emit('debug', msg));
     ws.on('error', err => this.emit('error', err));
     udp.on('error', err => this.emit('error', err));
     ws.on('ready', this.onReady.bind(this));
     ws.on('sessionDescription', this.onSessionDescription.bind(this));
     ws.on('speaking', this.onSpeaking.bind(this));
+
+    this.sockets.ws.connect();
   }
 
   /**
@@ -388,36 +422,37 @@ class VoiceConnection extends EventEmitter {
    * @param {Object} data The received data
    * @private
    */
-  onReady({ port, ssrc, ip, modes }) {
-    this.authentication.port = port;
-    this.authentication.ssrc = ssrc;
-    for (let mode of modes) {
+  onReady(data) {
+    this.authentication = data;
+    for (let mode of data.modes) {
       if (SUPPORTED_MODES.includes(mode)) {
-        this.authentication.encryptionMode = mode;
+        this.authentication.mode = mode;
         this.emit('debug', `Selecting the ${mode} mode`);
         break;
       }
     }
-    this.sockets.udp.createUDPSocket(ip);
+    this.sockets.udp.createUDPSocket(data.ip);
   }
 
   /**
    * Invoked when a session description is received.
-   * @param {string} mode The encryption mode
-   * @param {string} secret The secret key
+   * @param {Object} data The received data
    * @private
    */
-  onSessionDescription(mode, secret) {
-    this.authentication.encryptionMode = mode;
-    this.authentication.secretKey = secret;
-
+  onSessionDescription(data) {
+    Object.assign(this.authentication, data);
     this.status = VoiceStatus.CONNECTED;
-    /**
-     * Emitted once the connection is ready, when a promise to join a voice channel resolves,
-     * the connection will already be ready.
-     * @event VoiceConnection#ready
-     */
-    this.emit('ready');
+    const dispatcher = this.play(new SingleSilence(), { type: 'opus' });
+    dispatcher.on('finish', () => {
+      clearTimeout(this.connectTimeout);
+      this.emit('debug', `Ready with authentication details: ${JSON.stringify(this.authentication)}`);
+      /**
+       * Emitted once the connection is ready, when a promise to join a voice channel resolves,
+       * the connection will already be ready.
+       * @event VoiceConnection#ready
+       */
+      this.emit('ready');
+    });
   }
 
   /**
@@ -426,35 +461,37 @@ class VoiceConnection extends EventEmitter {
    * @private
    */
   onSpeaking({ user_id, ssrc, speaking }) {
+    speaking = new Speaking(speaking).freeze();
     const guild = this.channel.guild;
     const user = this.client.users.get(user_id);
-    this.ssrcMap.set(+ssrc, user);
+    this.ssrcMap.set(+ssrc, user_id);
+    const old = this._speaking.get(user_id);
+    this._speaking.set(user_id, speaking);
     /**
-     * Emitted whenever a user starts/stops speaking.
+     * Emitted whenever a user changes speaking state.
      * @event VoiceConnection#speaking
-     * @param {User} user The user that has started/stopped speaking
-     * @param {boolean} speaking Whether or not the user is speaking
+     * @param {User} user The user that has changed speaking state
+     * @param {Readonly<Speaking>} speaking The speaking state of the user
      */
     if (this.status === VoiceStatus.CONNECTED) {
       this.emit('speaking', user, speaking);
-      if (!speaking) {
-        for (const receiver of this.receivers) {
-          receiver.packets._stoppedSpeaking(user_id);
-        }
+      if (!speaking.has(Speaking.FLAGS.SPEAKING)) {
+        this.receiver.packets._stoppedSpeaking(user_id);
       }
     }
-    guild._memberSpeakUpdate(user_id, speaking);
-  }
 
-  /**
-   * Creates a VoiceReceiver so you can start listening to voice data.
-   * It's recommended to only create one of these.
-   * @returns {VoiceReceiver}
-   */
-  createReceiver() {
-    const receiver = new VoiceReceiver(this);
-    this.receivers.push(receiver);
-    return receiver;
+    if (guild && user && !speaking.equals(old)) {
+      const member = guild.member(user);
+      if (member) {
+        /**
+         * Emitted once a guild member changes speaking state.
+         * @event Client#guildMemberSpeaking
+         * @param {GuildMember} member The member that started/stopped speaking
+         * @param {Readonly<Speaking>} speaking The speaking state of the member
+         */
+        this.client.emit(Events.GUILD_MEMBER_SPEAKING, member, speaking);
+      }
+    }
   }
 
   play() {} // eslint-disable-line no-empty-function

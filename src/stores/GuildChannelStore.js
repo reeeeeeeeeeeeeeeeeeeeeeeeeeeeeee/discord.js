@@ -1,8 +1,10 @@
+'use strict';
+
 const Channel = require('../structures/Channel');
 const { ChannelTypes } = require('../util/Constants');
 const DataStore = require('./DataStore');
 const GuildChannel = require('../structures/GuildChannel');
-const resolvePermissions = require('../structures/shared/resolvePermissions');
+const PermissionOverwrites = require('../structures/PermissionOverwrites');
 
 /**
  * Stores guild channels.
@@ -22,14 +24,6 @@ class GuildChannelStore extends DataStore {
   }
 
   /**
-   * Can be used to overwrite permissions when creating a channel.
-   * @typedef {Object} PermissionOverwriteOptions
-   * @property {PermissionResolvable} [allowed] The permissions to allow
-   * @property {PermissionResolvable} [denied] The permissions to deny
-   * @property {RoleResolvable|UserResolvable} id ID of the role or member this overwrite is for
-   */
-
-  /**
    * Creates a new channel in the guild.
    * @param {string} name The name of the new channel
    * @param {Object} [options] Options
@@ -39,7 +33,10 @@ class GuildChannelStore extends DataStore {
    * @param {number} [options.bitrate] Bitrate of the new channel in bits (only voice)
    * @param {number} [options.userLimit] Maximum amount of users allowed in the new channel (only voice)
    * @param {ChannelResolvable} [options.parent] Parent of the new channel
-   * @param {Array<PermissionOverwrites|PermissionOverwriteOptions>} [options.overwrites] Permission overwrites
+   * @param {OverwriteResolvable[]|Collection<Snowflake, OverwriteResolvable>} [options.permissionOverwrites]
+   * Permission overwrites of the new channel
+   * @param {number} [options.position] Position of the new channel
+   * @param {number} [options.rateLimitPerUser] The ratelimit per user for the channel
    * @param {string} [options.reason] Reason for creating the channel
    * @returns {Promise<GuildChannel>}
    * @example
@@ -48,20 +45,36 @@ class GuildChannelStore extends DataStore {
    *   .then(console.log)
    *   .catch(console.error);
    * @example
-   * // Create a new channel with overwrites
+   * // Create a new channel with permission overwrites
    * guild.channels.create('new-voice', {
    *   type: 'voice',
-   *   overwrites: [
+   *   permissionOverwrites: [
    *      {
    *        id: message.author.id,
-   *        denied: ['VIEW_CHANNEL'],
+   *        deny: ['VIEW_CHANNEL'],
    *     },
    *   ],
    * })
    */
-  create(name, { type, topic, nsfw, bitrate, userLimit, parent, overwrites, reason } = {}) {
+  async create(name, options = {}) {
+    let {
+      type,
+      topic,
+      nsfw,
+      bitrate,
+      userLimit,
+      parent,
+      permissionOverwrites,
+      position,
+      rateLimitPerUser,
+      reason,
+    } = options;
     if (parent) parent = this.client.channels.resolveID(parent);
-    return this.client.api.guilds(this.guild.id).channels.post({
+    if (permissionOverwrites) {
+      permissionOverwrites = permissionOverwrites.map(o => PermissionOverwrites.resolve(o, this.guild));
+    }
+
+    const data = await this.client.api.guilds(this.guild.id).channels.post({
       data: {
         name,
         topic,
@@ -70,10 +83,13 @@ class GuildChannelStore extends DataStore {
         bitrate,
         user_limit: userLimit,
         parent_id: parent,
-        permission_overwrites: resolvePermissions.call(this, overwrites),
+        position,
+        permission_overwrites: permissionOverwrites,
+        rate_limit_per_user: rateLimitPerUser,
       },
       reason,
-    }).then(data => this.client.actions.ChannelCreate.handle(data).channel);
+    });
+    return this.client.actions.ChannelCreate.handle(data).channel;
   }
 
   /**

@@ -1,3 +1,5 @@
+'use strict';
+
 const Package = exports.Package = require('../../package.json');
 const { Error, RangeError } = require('../errors');
 const browser = exports.browser = typeof window !== 'undefined';
@@ -5,12 +7,10 @@ const browser = exports.browser = typeof window !== 'undefined';
 /**
  * Options for a client.
  * @typedef {Object} ClientOptions
- * @property {string} [apiRequestMethod='sequential'] One of `sequential` or `burst`. The sequential handler executes
- * all requests in the order they are triggered, whereas the burst handler runs multiple in parallel, and doesn't
- * provide the guarantee of any particular order. Burst mode is more likely to hit a 429 ratelimit error by its nature,
- * and is therefore slightly riskier to use.
- * @property {number} [shardId=0] ID of the shard to run
- * @property {number} [shardCount=0] Total number of shards
+ * @property {number|number[]} [shards] ID of the shard to run, or an array of shard IDs
+ * @property {number} [shardCount=1] Total number of shards that will be spawned by this Client
+ * @property {number} [totalShardCount=1] The total amount of shards used by all processes of this bot
+ * (e.g. recommended shard count, shard count of the ShardingManager)
  * @property {number} [messageCacheMaxSize=200] Maximum number of messages to cache per channel
  * (-1 or Infinity for unlimited - don't do this without message sweeping, otherwise memory usage will climb
  * indefinitely)
@@ -21,13 +21,16 @@ const browser = exports.browser = typeof window !== 'undefined';
  * @property {boolean} [fetchAllMembers=false] Whether to cache all guild members and users upon startup, as well as
  * upon joining a guild (should be avoided whenever possible)
  * @property {boolean} [disableEveryone=false] Default value for {@link MessageOptions#disableEveryone}
- * @property {boolean} [sync=false] Whether to periodically sync guilds (for user accounts)
+ * @property {PartialType[]} [partials] Structures allowed to be partial. This means events can be emitted even when
+ * they're missing all the data for a particular structure. See the "Partials" topic listed in the sidebar for some
+ * important usage information, as partials require you to put checks in place when handling data.
  * @property {number} [restWsBridgeTimeout=5000] Maximum time permitted between REST responses and their
  * corresponding websocket events
  * @property {number} [restTimeOffset=500] Extra time in millseconds to wait before continuing to make REST
  * requests (higher values will reduce rate-limiting errors on bad connections)
  * @property {number} [restSweepInterval=60] How frequently to delete inactive request buckets, in seconds
  * (or 0 for never)
+ * @property {number} [retryLimit=1] How many times to retry on 5XX errors (Infinity for indefinite amount of retries)
  * @property {PresenceData} [presence] Presence data to use upon login
  * @property {WSEventType[]} [disabledEvents] An array of disabled websocket events. Events in this array will not be
  * processed, potentially resulting in performance improvements for larger bots. Only disable events you are
@@ -37,18 +40,17 @@ const browser = exports.browser = typeof window !== 'undefined';
  * @property {HTTPOptions} [http] HTTP options
  */
 exports.DefaultOptions = {
-  apiRequestMethod: 'sequential',
-  shardId: 0,
-  shardCount: 0,
-  internalSharding: false,
+  shardCount: 1,
+  totalShardCount: 1,
   messageCacheMaxSize: 200,
   messageCacheLifetime: 0,
   messageSweepInterval: 0,
   fetchAllMembers: false,
   disableEveryone: false,
-  sync: false,
+  partials: [],
   restWsBridgeTimeout: 5000,
   disabledEvents: [],
+  retryLimit: 1,
   restTimeOffset: 500,
   restSweepInterval: 60,
   presence: {},
@@ -91,10 +93,10 @@ exports.UserAgent = browser ? null :
   `DiscordBot (${Package.homepage.split('#')[0]}, ${Package.version}) Node.js/${process.version}`;
 
 exports.WSCodes = {
-  1000: 'Connection gracefully closed',
-  4004: 'Tried to identify with an invalid token',
-  4010: 'Sharding data provided was invalid',
-  4011: 'Shard would be on too many guilds if connected',
+  1000: 'WS_CLOSE_REQUESTED',
+  4004: 'TOKEN_INVALID',
+  4010: 'SHARDING_INVALID',
+  4011: 'SHARDING_REQUIRED',
 };
 
 const AllowedImageFormats = [
@@ -111,6 +113,13 @@ function makeImageUrl(root, { format = 'webp', size } = {}) {
   if (size && !AllowedImageSizes.includes(size)) throw new RangeError('IMAGE_SIZE', size);
   return `${root}.${format}${size ? `?size=${size}` : ''}`;
 }
+/**
+ * Options for Image URLs.
+ * @typedef {Object} ImageURLOptions
+ * @property {string} [format] One of `webp`, `png`, `jpg`, `gif`. If no format is provided,
+ * it will be `gif` for animated avatars or otherwise `webp`
+ * @property {number} [size] One of `16`, `32`, `64`, `128`, `256`, `512`, `1024`, `2048`
+ */
 
 exports.Endpoints = {
   CDN(root) {
@@ -119,7 +128,6 @@ exports.Endpoints = {
       Asset: name => `${root}/assets/${name}`,
       DefaultAvatar: number => `${root}/embed/avatars/${number}.png`,
       Avatar: (userID, hash, format = 'default', size) => {
-        if (userID === '1') return hash;
         if (format === 'default') format = hash.startsWith('a_') ? 'gif' : 'webp';
         return makeImageUrl(`${root}/avatars/${userID}/${hash}`, { format, size });
       },
@@ -197,6 +205,9 @@ exports.VoiceOPCodes = {
   HEARTBEAT: 3,
   SESSION_DESCRIPTION: 4,
   SPEAKING: 5,
+  HELLO: 8,
+  CLIENT_CONNECT: 12,
+  CLIENT_DISCONNECT: 13,
 };
 
 exports.Events = {
@@ -214,6 +225,7 @@ exports.Events = {
   GUILD_MEMBER_AVAILABLE: 'guildMemberAvailable',
   GUILD_MEMBER_SPEAKING: 'guildMemberSpeaking',
   GUILD_MEMBERS_CHUNK: 'guildMembersChunk',
+  GUILD_INTEGRATIONS_UPDATE: 'guildIntegrationsUpdate',
   GUILD_ROLE_CREATE: 'roleCreate',
   GUILD_ROLE_DELETE: 'roleDelete',
   GUILD_ROLE_UPDATE: 'roleUpdate',
@@ -236,25 +248,45 @@ exports.Events = {
   USER_UPDATE: 'userUpdate',
   USER_NOTE_UPDATE: 'userNoteUpdate',
   USER_SETTINGS_UPDATE: 'clientUserSettingsUpdate',
-  USER_GUILD_SETTINGS_UPDATE: 'clientUserGuildSettingsUpdate',
   PRESENCE_UPDATE: 'presenceUpdate',
+  VOICE_SERVER_UPDATE: 'voiceServerUpdate',
   VOICE_STATE_UPDATE: 'voiceStateUpdate',
   VOICE_BROADCAST_SUBSCRIBE: 'subscribe',
   VOICE_BROADCAST_UNSUBSCRIBE: 'unsubscribe',
   TYPING_START: 'typingStart',
   TYPING_STOP: 'typingStop',
+  WEBHOOKS_UPDATE: 'webhookUpdate',
   DISCONNECT: 'disconnect',
   RECONNECTING: 'reconnecting',
   ERROR: 'error',
   WARN: 'warn',
   DEBUG: 'debug',
+  SHARD_READY: 'shardReady',
+  INVALIDATED: 'invalidated',
+  RAW: 'raw',
 };
+
+/**
+ * The type of Structure allowed to be a partial:
+ * * USER
+ * * CHANNEL (only affects DMChannels)
+ * * GUILD_MEMBER
+ * * MESSAGE
+ * <warn>Partials require you to put checks in place when handling data, read the Partials topic listed in the
+ * sidebar for more information.</warn>
+ * @typedef {string} PartialType
+ */
+exports.PartialTypes = keyMirror([
+  'USER',
+  'CHANNEL',
+  'GUILD_MEMBER',
+  'MESSAGE',
+]);
 
 /**
  * The type of a websocket message event, e.g. `MESSAGE_CREATE`. Here are the available events:
  * * READY
  * * RESUMED
- * * GUILD_SYNC
  * * GUILD_CREATE
  * * GUILD_DELETE
  * * GUILD_UPDATE
@@ -262,6 +294,7 @@ exports.Events = {
  * * GUILD_MEMBER_REMOVE
  * * GUILD_MEMBER_UPDATE
  * * GUILD_MEMBERS_CHUNK
+ * * GUILD_INTEGRATIONS_UPDATE
  * * GUILD_ROLE_CREATE
  * * GUILD_ROLE_DELETE
  * * GUILD_ROLE_UPDATE
@@ -284,15 +317,14 @@ exports.Events = {
  * * PRESENCE_UPDATE
  * * VOICE_STATE_UPDATE
  * * TYPING_START
+ * * VOICE_STATE_UPDATE
  * * VOICE_SERVER_UPDATE
- * * RELATIONSHIP_ADD
- * * RELATIONSHIP_REMOVE
+ * * WEBHOOKS_UPDATE
  * @typedef {string} WSEventType
  */
 exports.WSEvents = keyMirror([
   'READY',
   'RESUMED',
-  'GUILD_SYNC',
   'GUILD_CREATE',
   'GUILD_DELETE',
   'GUILD_UPDATE',
@@ -300,6 +332,7 @@ exports.WSEvents = keyMirror([
   'GUILD_MEMBER_REMOVE',
   'GUILD_MEMBER_UPDATE',
   'GUILD_MEMBERS_CHUNK',
+  'GUILD_INTEGRATIONS_UPDATE',
   'GUILD_ROLE_CREATE',
   'GUILD_ROLE_DELETE',
   'GUILD_ROLE_UPDATE',
@@ -318,15 +351,12 @@ exports.WSEvents = keyMirror([
   'MESSAGE_REACTION_REMOVE',
   'MESSAGE_REACTION_REMOVE_ALL',
   'USER_UPDATE',
-  'USER_NOTE_UPDATE',
-  'USER_SETTINGS_UPDATE',
-  'USER_GUILD_SETTINGS_UPDATE',
   'PRESENCE_UPDATE',
   'VOICE_STATE_UPDATE',
   'TYPING_START',
+  'VOICE_STATE_UPDATE',
   'VOICE_SERVER_UPDATE',
-  'RELATIONSHIP_ADD',
-  'RELATIONSHIP_REMOVE',
+  'WEBHOOKS_UPDATE',
 ]);
 
 /**
@@ -367,228 +397,6 @@ exports.ActivityTypes = [
   'WATCHING',
 ];
 
-exports.ActivityFlags = {
-  INSTANCE: 1 << 0,
-  JOIN: 1 << 1,
-  SPECTATE: 1 << 2,
-  JOIN_REQUEST: 1 << 3,
-  SYNC: 1 << 4,
-  PLAY: 1 << 5,
-};
-
-exports.ExplicitContentFilterTypes = [
-  'DISABLED',
-  'NON_FRIENDS',
-  'FRIENDS_AND_NON_FRIENDS',
-];
-
-exports.MessageNotificationTypes = [
-  'EVERYTHING',
-  'MENTIONS',
-  'NOTHING',
-  'INHERIT',
-];
-
-exports.UserSettingsMap = {
-  /**
-   * Automatically convert emoticons in your messages to emoji,
-   * for example when you type `:-)` Discord will convert it to 😃
-   * @name ClientUserSettings#convertEmoticons
-   * @type {boolean}
-   */
-  convert_emoticons: 'convertEmoticons',
-
-  /**
-   * If new guilds should automatically disable DMs between you and its members
-   * @name ClientUserSettings#defaultGuildsRestricted
-   * @type {boolean}
-   */
-  default_guilds_restricted: 'defaultGuildsRestricted',
-
-  /**
-   * Automatically detect accounts from services like Steam and Blizzard when you open the Discord client
-   * @name ClientUserSettings#detectPlatformAccounts
-   * @type {boolean}
-   */
-  detect_platform_accounts: 'detectPlatformAccounts',
-
-  /**
-   * Developer Mode exposes context menu items helpful for people writing bots using the Discord API
-   * @name ClientUserSettings#developerMode
-   * @type {boolean}
-   */
-  developer_mode: 'developerMode',
-
-  /**
-   * Allow playback and usage of the `/tts` command
-   * @name ClientUserSettings#enableTTSCommand
-   * @type {boolean}
-   */
-  enable_tts_command: 'enableTTSCommand',
-
-  /**
-   * The theme of the client. Either `light` or `dark`
-   * @name ClientUserSettings#theme
-   * @type {string}
-   */
-  theme: 'theme',
-
-  /**
-   * Last status set in the client
-   * @name ClientUserSettings#status
-   * @type {PresenceStatus}
-   */
-  status: 'status',
-
-  /**
-   * Display currently running game as status message
-   * @name ClientUserSettings#showCurrentGame
-   * @type {boolean}
-   */
-  show_current_game: 'showCurrentGame',
-
-  /**
-   * Display images, videos, and lolcats when uploaded directly to Discord
-   * @name ClientUserSettings#inlineAttachmentMedia
-   * @type {boolean}
-   */
-  inline_attachment_media: 'inlineAttachmentMedia',
-
-  /**
-   * Display images, videos, and lolcats when posted as links in chat
-   * @name ClientUserSettings#inlineEmbedMedia
-   * @type {boolean}
-   */
-  inline_embed_media: 'inlineEmbedMedia',
-
-  /**
-   * Language the Discord client will use, as an RFC 3066 language identifier
-   * @name ClientUserSettings#locale
-   * @type {string}
-   */
-  locale: 'locale',
-
-  /**
-   * Display messages in compact mode
-   * @name ClientUserSettings#messageDisplayCompact
-   * @type {boolean}
-   */
-  message_display_compact: 'messageDisplayCompact',
-
-  /**
-   * Show emoji reactions on messages
-   * @name ClientUserSettings#renderReactions
-   * @type {boolean}
-   */
-  render_reactions: 'renderReactions',
-
-  /**
-   * Array of snowflake IDs for guilds, in the order they appear in the Discord client
-   * @name ClientUserSettings#guildPositions
-   * @type {Snowflake[]}
-   */
-  guild_positions: 'guildPositions',
-
-  /**
-   * Array of snowflake IDs for guilds which you will not recieve DMs from
-   * @name ClientUserSettings#restrictedGuilds
-   * @type {Snowflake[]}
-   */
-  restricted_guilds: 'restrictedGuilds',
-
-  explicit_content_filter: function explicitContentFilter(type) { // eslint-disable-line func-name-matching
-    /**
-     * Safe direct messaging; force people's messages with images to be scanned before they are sent to you.
-     * One of `DISABLED`, `NON_FRIENDS`, `FRIENDS_AND_NON_FRIENDS`
-     * @name ClientUserSettings#explicitContentFilter
-     * @type {string}
-     */
-    return exports.ExplicitContentFilterTypes[type];
-  },
-  friend_source_flags: function friendSources(flags) { // eslint-disable-line func-name-matching
-    /**
-     * Who can add you as a friend
-     * @name ClientUserSettings#friendSources
-     * @type {Object}
-     * @property {boolean} all Mutual friends and mutual guilds
-     * @property {boolean} mutualGuilds Only mutual guilds
-     * @property {boolean} mutualFriends Only mutual friends
-     */
-    return {
-      all: flags.all || false,
-      mutualGuilds: flags.all ? true : flags.mutual_guilds || false,
-      mutualFriends: flags.all ? true : flags.mutualFriends || false,
-    };
-  },
-};
-
-exports.UserGuildSettingsMap = {
-  message_notifications: function messageNotifications(type) { // eslint-disable-line func-name-matching
-    /**
-     * The type of message that should notify you.
-     * One of `EVERYTHING`, `MENTIONS`, `NOTHING`
-     * @name ClientUserGuildSettings#messageNotifications
-     * @type {string}
-     */
-    return exports.MessageNotificationTypes[type];
-  },
-  /**
-   * Whether to receive mobile push notifications
-   * @name ClientUserGuildSettings#mobilePush
-   * @type {boolean}
-   */
-  mobile_push: 'mobilePush',
-  /**
-   * Whether the guild is muted or not
-   * @name ClientUserGuildSettings#muted
-   * @type {boolean}
-   */
-  muted: 'muted',
-  /**
-   * Whether to suppress everyone messages
-   * @name ClientUserGuildSettings#suppressEveryone
-   * @type {boolean}
-   */
-  suppress_everyone: 'suppressEveryone',
-  /**
-   * A collection containing all the channel overrides
-   * @name ClientUserGuildSettings#channelOverrides
-   * @type {Collection<ClientUserChannelOverride>}
-   */
-  channel_overrides: 'channelOverrides',
-};
-
-exports.UserChannelOverrideMap = {
-  message_notifications: function messageNotifications(type) { // eslint-disable-line func-name-matching
-    /**
-     * The type of message that should notify you.
-     * One of `EVERYTHING`, `MENTIONS`, `NOTHING`, `INHERIT`
-     * @name ClientUserChannelOverride#messageNotifications
-     * @type {string}
-     */
-    return exports.MessageNotificationTypes[type];
-  },
-  /**
-   * Whether the channel is muted or not
-   * @name ClientUserChannelOverride#muted
-   * @type {boolean}
-   */
-  muted: 'muted',
-};
-
-/**
- * All flags users can have:
- * * STAFF
- * * PARTNER
- * * HYPESQUAD
- * @typedef {string} UserFlags
- */
-exports.UserFlags = {
-  STAFF: 1 << 0,
-  PARTNER: 1 << 1,
-  HYPESQUAD: 1 << 2,
-};
-
 exports.ChannelTypes = {
   TEXT: 0,
   DM: 1,
@@ -604,6 +412,7 @@ exports.ClientApplicationAssetTypes = {
 
 exports.Colors = {
   DEFAULT: 0x000000,
+  WHITE: 0xFFFFFF,
   AQUA: 0x1ABC9C,
   GREEN: 0x2ECC71,
   BLUE: 0x3498DB,
@@ -648,6 +457,7 @@ exports.Colors = {
  * * UNKNOWN_TOKEN
  * * UNKNOWN_USER
  * * UNKNOWN_EMOJI
+ * * UNKNOWN_WEBHOOK
  * * BOT_PROHIBITED_ENDPOINT
  * * BOT_ONLY_ENDPOINT
  * * MAXIMUM_GUILDS
@@ -673,6 +483,7 @@ exports.Colors = {
  * * NOTE_TOO_LONG
  * * INVALID_BULK_DELETE_QUANTITY
  * * CANNOT_PIN_MESSAGE_IN_OTHER_CHANNEL
+ * * INVALID_OR_TAKEN_INVITE_CODE
  * * CANNOT_EXECUTE_ON_SYSTEM_MESSAGE
  * * BULK_DELETE_MESSAGE_TOO_OLD
  * * INVITE_ACCEPTED_TO_GUILD_NOT_CONTAINING_BOT
@@ -694,6 +505,7 @@ exports.APIErrors = {
   UNKNOWN_TOKEN: 10012,
   UNKNOWN_USER: 10013,
   UNKNOWN_EMOJI: 10014,
+  UNKNOWN_WEBHOOK: 10015,
   BOT_PROHIBITED_ENDPOINT: 20001,
   BOT_ONLY_ENDPOINT: 20002,
   MAXIMUM_GUILDS: 30001,
@@ -719,6 +531,7 @@ exports.APIErrors = {
   NOTE_TOO_LONG: 50015,
   INVALID_BULK_DELETE_QUANTITY: 50016,
   CANNOT_PIN_MESSAGE_IN_OTHER_CHANNEL: 50019,
+  INVALID_OR_TAKEN_INVITE_CODE: 50020,
   CANNOT_EXECUTE_ON_SYSTEM_MESSAGE: 50021,
   BULK_DELETE_MESSAGE_TOO_OLD: 50034,
   INVITE_ACCEPTED_TO_GUILD_NOT_CONTAINING_BOT: 50036,

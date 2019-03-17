@@ -1,3 +1,5 @@
+'use strict';
+
 const DataStore = require('./DataStore');
 const User = require('../structures/User');
 const GuildMember = require('../structures/GuildMember');
@@ -45,16 +47,15 @@ class UserStore extends DataStore {
 
   /**
    * Obtains a user from Discord, or the user cache if it's already available.
-   * <warn>This is only available when using a bot account.</warn>
    * @param {Snowflake} id ID of the user
    * @param {boolean} [cache=true] Whether to cache the new user object if it isn't already
    * @returns {Promise<User>}
    */
-  fetch(id, cache = true) {
+  async fetch(id, cache = true) {
     const existing = this.get(id);
-    if (existing) return Promise.resolve(existing);
-
-    return this.client.api.users(id).get().then(data => this.add(data, cache));
+    if (existing && !existing.partial) return existing;
+    const data = await this.client.api.users(id).get();
+    return this.add(data, cache);
   }
 }
 

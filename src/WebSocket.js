@@ -1,3 +1,5 @@
+'use strict';
+
 const { browser } = require('./util/Constants');
 const querystring = require('querystring');
 try {
@@ -9,7 +11,7 @@ if (browser) {
   exports.WebSocket = window.WebSocket; // eslint-disable-line no-undef
 } else {
   try {
-    exports.WebSocket = require('uws');
+    exports.WebSocket = require('@discordjs/uws');
   } catch (err) {
     exports.WebSocket = require('ws');
   }

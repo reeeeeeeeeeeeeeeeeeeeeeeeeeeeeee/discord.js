@@ -1,3 +1,5 @@
+'use strict';
+
 const DataStore = require('./DataStore');
 const DataResolver = require('../util/DataResolver');
 const { Events } = require('../util/Constants');
@@ -39,7 +41,7 @@ class GuildStore extends DataStore {
 
   /**
    * Creates a guild.
-   * <warn>This is only available to bots in less than 10 guilds and user accounts.</warn>
+   * <warn>This is only available to bots in fewer than 10 guilds.</warn>
    * @param {string} name The name of the guild
    * @param {Object} [options] Options for the creating
    * @param {string} [options.region] The region for the server, defaults to the closest one available

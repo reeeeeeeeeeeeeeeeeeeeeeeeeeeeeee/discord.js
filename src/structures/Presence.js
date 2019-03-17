@@ -1,5 +1,8 @@
+'use strict';
+
 const Util = require('../util/Util');
-const { ActivityTypes, ActivityFlags } = require('../util/Constants');
+const ActivityFlags = require('../util/ActivityFlags');
+const { ActivityTypes } = require('../util/Constants');
 
 /**
  * Activity sent in a message.
@@ -9,32 +12,74 @@ const { ActivityTypes, ActivityFlags } = require('../util/Constants');
  */
 
 /**
+ * The status of this presence:
+ *
+ * * **`online`** - user is online
+ * * **`idle`** - user is AFK
+ * * **`offline`** - user is offline or invisible
+ * * **`dnd`** - user is in Do Not Disturb
+ * @typedef {string} PresenceStatus
+ */
+
+/**
  * Represents a user's presence.
  */
 class Presence {
   constructor(client, data = {}) {
     Object.defineProperty(this, 'client', { value: client });
+    /**
+     * The user ID of this presence
+     * @type {Snowflake}
+     */
+    this.userID = data.user.id;
+
+    /**
+     * The guild of this presence
+     * @type {?Guild}
+     */
+    this.guild = data.guild;
+
     this.patch(data);
+  }
+
+  /**
+   * The user of this presence
+   * @type {?User}
+   */
+  get user() {
+    return this.client.users.get(this.userID) || null;
+  }
+
+  /**
+   * The member of this presence
+   * @type {?GuildMember}
+   */
+  get member() {
+    return this.guild.members.get(this.userID) || null;
   }
 
   patch(data) {
     /**
-     * The status of the presence:
-     *
-     * * **`online`** - user is online
-     * * **`offline`** - user is offline or invisible
-     * * **`idle`** - user is AFK
-     * * **`dnd`** - user is in Do Not Disturb
-     * @type {string}
+     * The status of this presence
+     * @type {PresenceStatus}
      */
     this.status = data.status || this.status || 'offline';
 
     const activity = data.game || data.activity;
     /**
-     * The activity of the presence
+     * The activity of this presence
      * @type {?Activity}
      */
     this.activity = activity ? new Activity(this, activity) : null;
+
+    /**
+     * The devices this presence is on
+     * @type {?object}
+     * @property {PresenceStatus} web
+     * @property {PresenceStatus} mobile
+     * @property {PresenceStatus} desktop
+     */
+    this.clientStatus = data.client_status || null;
 
     return this;
   }
@@ -54,7 +99,10 @@ class Presence {
     return this === presence || (
       presence &&
       this.status === presence.status &&
-      this.activity ? this.activity.equals(presence.activity) : !presence.activity
+      this.activity ? this.activity.equals(presence.activity) : !presence.activity &&
+        this.clientStatus.web === presence.clientStatus.web &&
+        this.clientStatus.mobile === presence.clientStatus.mobile &&
+        this.clientStatus.desktop === presence.clientStatus.desktop
     );
   }
 
@@ -132,15 +180,12 @@ class Activity {
     this.assets = data.assets ? new RichPresenceAssets(this, data.assets) : null;
 
     this.syncID = data.sync_id;
-    this._flags = data.flags;
-  }
 
-  get flags() {
-    const flags = [];
-    for (const [name, flag] of Object.entries(ActivityFlags)) {
-      if ((this._flags & flag) === flag) flags.push(name);
-    }
-    return flags;
+    /**
+     * Flags that describe the activity
+     * @type {Readonly<ActivityFlags>}
+     */
+    this.flags = new ActivityFlags(data.flags).freeze();
   }
 
   /**

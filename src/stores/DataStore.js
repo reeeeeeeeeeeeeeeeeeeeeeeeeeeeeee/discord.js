@@ -1,3 +1,5 @@
+'use strict';
+
 const Collection = require('../util/Collection');
 let Structures;
 
@@ -16,6 +18,7 @@ class DataStore extends Collection {
 
   add(data, cache = true, { id, extras = [] } = {}) {
     const existing = this.get(id || data.id);
+    if (existing && existing.partial && cache && existing._patch) existing._patch(data);
     if (existing) return existing;
 
     const entry = this.holds ? new this.holds(this.client, data, ...extras) : data;
@@ -45,6 +48,10 @@ class DataStore extends Collection {
     if (idOrInstance instanceof this.holds) return idOrInstance.id;
     if (typeof idOrInstance === 'string') return idOrInstance;
     return null;
+  }
+
+  static get [Symbol.species]() {
+    return Collection;
   }
 }
 

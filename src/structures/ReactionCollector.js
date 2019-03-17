@@ -1,3 +1,5 @@
+'use strict';
+
 const Collector = require('./interfaces/Collector');
 const Collection = require('../util/Collection');
 const { Events } = require('../util/Constants');
@@ -105,7 +107,8 @@ class ReactionCollector extends Collector {
      * @param {MessageReaction} reaction The reaction that was removed
      * @param {User} user The user that removed the reaction
      */
-    if (this.collected.has(ReactionCollector.key(reaction))) {
+    if (this.collected.has(ReactionCollector.key(reaction)) &&
+        this.users.has(user.id)) {
       this.emit('remove', reaction, user);
     }
     return reaction.count ? null : ReactionCollector.key(reaction);

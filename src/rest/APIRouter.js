@@ -1,3 +1,5 @@
+'use strict';
+
 const noop = () => {}; // eslint-disable-line no-empty-function
 const methods = ['get', 'post', 'delete', 'patch', 'put'];
 const reflectors = [
@@ -15,6 +17,7 @@ function buildRoute(manager) {
           versioned: manager.versioned,
           route: route.map((r, i) => {
             if (/\d{16,19}/g.test(r)) return /channels|guilds/.test(route[i - 1]) ? r : ':id';
+            if (route[i - 1] === 'reactions') return ':reaction';
             return r;
           }).join('/'),
         }, options));
